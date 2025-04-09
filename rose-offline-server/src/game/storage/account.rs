@@ -17,7 +17,7 @@ pub enum AccountStorageError {
     NotFound,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct AccountStorage {
     pub name: String,
     pub password_md5_sha256: String,

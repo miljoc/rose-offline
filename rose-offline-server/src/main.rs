@@ -26,7 +26,7 @@ use rose_file_readers::{
 };
 
 use crate::{
-    game::GameConfig,
+    game::{GameConfig, storage::StorageBackend},
     protocol::server::{GameServer, LoginServer, WorldServer},
 };
 
@@ -103,6 +103,19 @@ async fn async_main() {
                 .value_parser(["irose"])
                 .default_value("irose")
                 .help("Select which protocol to use."),
+        )
+        .arg(
+            clap::Arg::new("use-postgres")
+                .long("use-postgres")
+                .help("Use PostgreSQL for storage instead of JSON files")
+                .takes_value(false),
+        )
+        .arg(
+            clap::Arg::new("postgres-connection")
+                .long("postgres-connection")
+                .help("PostgreSQL connection string (postgresql://user:pass@host/dbname)")
+                .takes_value(true)
+                .default_value("postgresql://postgres:postgres@localhost/rose_offline"),
         );
     let data_path_error = command.error(
         clap::ErrorKind::ArgumentNotFound,
@@ -135,6 +148,16 @@ async fn async_main() {
             data_path_error.exit();
         }
     }
+
+    // Setup storage backend
+    let storage_backend = if matches.is_present("use-postgres") {
+        let connection_string = matches.value_of("postgres-connection").unwrap().to_string();
+        log::info!("Using PostgreSQL storage backend with connection: {}", connection_string);
+        StorageBackend::from_postgres_connection_string(connection_string)
+    } else {
+        log::info!("Using JSON file storage backend");
+        StorageBackend::default()
+    };
 
     let mut vfs_devices: Vec<Box<dyn VirtualFilesystemDevice + Send + Sync>> = Vec::new();
     if let Some(data_extracted_path) = data_extracted_path {
@@ -176,7 +199,10 @@ async fn async_main() {
     let game_config = GameConfig {
         enable_npc_spawns: true,
         enable_monster_spawns: true,
+        storage_backend,
     };
+
+    debug!("Using StorageBackend: {:?}", game_config.storage_backend);
 
     let (game_control_tx, game_control_rx) = crossbeam_channel::unbounded();
     std::thread::spawn(move || {

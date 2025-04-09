@@ -21,3 +21,6 @@ pub use server_messages::ServerMessages;
 pub use world_rates::WorldRates;
 pub use world_time::WorldTime;
 pub use zone_list::ZoneList;
+
+// Re-exported from storage
+pub use crate::game::storage::StorageBackend;

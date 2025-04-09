@@ -1,10 +1,12 @@
 use std::time::Duration;
+use std::sync::Arc;
+use tokio::runtime::Runtime;
 
 use bevy::{
     app::ScheduleRunnerPlugin,
     prelude::{
         apply_deferred, App, IntoSystemConfigs, Last, PluginGroup, PostUpdate, PreUpdate, Startup,
-        Update,
+        Update, Resource,
     },
     MinimalPlugins,
 };
@@ -24,7 +26,7 @@ use crate::game::{
         ServerMessages, WorldRates, WorldTime, ZoneList,
     },
     systems::{
-        ability_values_changed_system, ability_values_update_character_system,
+        database_system, ability_values_changed_system, ability_values_update_character_system,
         ability_values_update_npc_system, bank_system, chat_commands_system, clan_system,
         client_entity_visibility_system, command_system, control_server_system, damage_system,
         driving_time_system, equipment_event_system, experience_points_system, expire_time_system,
@@ -39,7 +41,19 @@ use crate::game::{
         use_ammo_system, use_item_system, weight_system, world_server_authentication_system,
         world_server_system, world_time_system,
     },
+    storage::{
+        storage_adapter, storage_service,
+    }
 };
+
+use crate::game::storage::config::StorageConfig;
+use crate::game::storage::StorageService;
+use crate::game::storage::StorageAdapter;
+use crate::game::storage::JsonStorageAdapter;
+use crate::game::storage::PostgresStorageAdapter;
+use crate::game::storage::StorageBackend;
+use crate::game::storage::StorageService as StorageServiceType;
+use crate::game::storage::StorageBackend as StorageBackendType;
 
 pub struct GameWorld {
     control_rx: Receiver<ControlMessage>,
@@ -51,6 +65,49 @@ impl GameWorld {
     }
 
     pub fn run(&mut self, game_config: GameConfig, game_data: GameData) {
+        // Create a tokio runtime for async operations
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        
+        // Convert the StorageBackend from game_config to config::StorageBackend
+        let backend = match &game_config.storage_backend {
+            StorageBackendType::JsonStorageAdapter => crate::game::storage::config::StorageBackend::JsonStorageAdapter,
+            StorageBackendType::PostgresStorageAdapter(conn_string) => 
+                crate::game::storage::config::StorageBackend::PostgresStorageAdapter(conn_string.clone()),
+            _ => crate::game::storage::config::StorageBackend::Json,
+        };
+        
+        // Create the storage config and adapter
+        let storage_config = StorageConfig::new(backend);
+        
+        // Create the appropriate adapter based on the storage backend
+        let adapter: Arc<dyn StorageAdapter> = match &game_config.storage_backend {
+            StorageBackendType::JsonStorageAdapter => {
+                let adapter = JsonStorageAdapter::new();
+                runtime.block_on(async {
+                    adapter.init().await.expect("Failed to initialize JSON storage adapter");
+                });
+                Arc::new(adapter)
+            },
+            StorageBackendType::PostgresStorageAdapter(conn_string) => {
+                let adapter = runtime.block_on(async {
+                    PostgresStorageAdapter::new(conn_string)
+                        .await
+                        .expect("Failed to create PostgreSQL adapter")
+                });
+                
+                // Initialize the adapter after creating it
+                runtime.block_on(async {
+                    adapter.init().await.expect("Failed to initialize PostgreSQL storage adapter");
+                });
+                
+                Arc::new(adapter)
+            }
+        };
+
+        // Use the storage_service::StorageService 
+        let storage_service = StorageService::new(adapter);
+        
+        // Rest of your application setup...
         let mut app = App::new();
         app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(
             Duration::from_secs_f64(1.0 / 60.0),
@@ -68,6 +125,7 @@ impl GameWorld {
         app.insert_resource(ZoneList::new());
         app.insert_resource(game_config);
         app.insert_resource(game_data);
+        app.insert_resource(storage_service);
 
         app.add_event::<BankEvent>()
             .add_event::<ChatCommandEvent>()
@@ -98,7 +156,11 @@ impl GameWorld {
         - CoreSet::PostUpdate
         - CoreSet::Last
         */
-        app.add_systems(Startup, (startup_clans_system, startup_zones_system));
+        app.add_systems(Startup, (
+            startup_clans_system,
+            startup_zones_system,
+            database_system
+        ));
 
         app.add_systems(
             PreUpdate,

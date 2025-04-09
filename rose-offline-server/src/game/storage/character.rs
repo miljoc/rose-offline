@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{io::Write, path::PathBuf};
 
 use rose_game_common::components::CharacterGender;
+use crate::game::storage::CHARACTER_STORAGE_DIR;
 
 use crate::game::{
     components::{
@@ -10,7 +11,6 @@ use crate::game::{
         Hotbar, Inventory, Level, ManaPoints, Position, QuestState, SkillList, SkillPoints,
         Stamina, StatPoints, UnionMembership,
     },
-    storage::CHARACTER_STORAGE_DIR,
 };
 
 #[derive(Deserialize, Serialize)]

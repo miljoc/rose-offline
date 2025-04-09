@@ -39,7 +39,7 @@ use crate::game::{
         server::{ConnectionRequestError, ServerMessage},
     },
     resources::{ClientEntityList, GameData, LoginTokens, ServerMessages, WorldRates, WorldTime},
-    storage::{account::AccountStorage, bank::BankStorage, character::CharacterStorage},
+    storage::{account::AccountStorage, bank::BankStorage, character::CharacterStorage, StorageService},
 };
 
 fn handle_game_connection_request(
@@ -52,6 +52,7 @@ fn handle_game_connection_request(
     password: &Password,
     query_world_client: &mut Query<&mut WorldClient>,
     query_clans: &mut Query<(Entity, &mut Clan)>,
+    storage_service: &StorageService,
 ) -> Result<
     (
         u32,
@@ -76,47 +77,87 @@ fn handle_game_connection_request(
             return Err(ConnectionRequestError::InvalidToken);
         };
 
-    // Verify account password
-    let account: Account = AccountStorage::try_load(&login_token.username, password)
-        .map_err(|error| {
-            log::error!(
-                "Failed to load account {} with error {:?}",
-                &login_token.username,
-                error
-            );
-            ConnectionRequestError::InvalidPassword
-        })?
-        .into();
+    // Create a static runtime for async operations
+    static CONNECTION_RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> = 
+        once_cell::sync::Lazy::new(|| tokio::runtime::Runtime::new().expect("Failed to create runtime"));
 
-    // Try load bank
-    let bank = match BankStorage::try_load(&login_token.username) {
-        Ok(bank_storage) => Bank::from(bank_storage),
-        Err(_) => match BankStorage::create(&login_token.username) {
-            Ok(bank_storage) => {
-                log::info!("Created bank storage for account {}", &login_token.username);
-                Bank::from(bank_storage)
+    // Verify account password - using StorageService
+    let account: Account = CONNECTION_RUNTIME.block_on(async {
+        let password_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(password.to_md5());
+            hex::encode(hasher.finalize())
+        };
+        
+        match storage_service.load_account(&login_token.username, &password_hash).await {
+            Ok(Some(account_storage)) => Ok(Account::from(account_storage)),
+            Ok(None) => Err(ConnectionRequestError::InvalidPassword),
+            Err(error) => {
+                log::error!("Failed to load account {} with error {:?}", 
+                    &login_token.username, error);
+                Err(ConnectionRequestError::InvalidPassword)
             }
+        }
+    })?;
+
+    // Try load bank - using StorageService
+    let bank = CONNECTION_RUNTIME.block_on(async {
+        match storage_service.load_bank(&login_token.username).await {
+            Ok(Some(bank_storage)) => {
+                log::info!("Loaded bank storage for account {}", &login_token.username);
+                Ok(Bank::from(bank_storage))
+            },
+            Ok(None) => {
+                // If no bank exists, create a default bank
+                let bank_storage = BankStorage::default();
+                match storage_service.create_bank(&login_token.username, &bank_storage).await {
+                    Ok(_) => {
+                        log::info!("Created new bank storage for account {}", &login_token.username);
+                        Ok(Bank::from(bank_storage))
+                    },
+                    Err(error) => {
+                        log::error!(
+                            "Failed to create bank storage for account {} with error {:?}",
+                            &login_token.username,
+                            error
+                        );
+                        Err(ConnectionRequestError::Failed)
+                    }
+                }
+            },
             Err(error) => {
                 log::error!(
-                    "Failed to create bank storage for account {} with error {}",
+                    "Failed to load bank storage for account {} with error {:?}",
                     &login_token.username,
                     error
                 );
-                return Err(ConnectionRequestError::Failed);
+                Err(ConnectionRequestError::Failed)
             }
-        },
-    };
+        }
+    })?;
 
-    // Try load character
-    let character =
-        CharacterStorage::try_load(&login_token.selected_character).map_err(|error| {
-            log::error!(
-                "Failed to load character {} with error {:?}",
-                &login_token.selected_character,
-                error
-            );
-            ConnectionRequestError::Failed
-        })?;
+    // Try load character - using StorageService
+    let character = CONNECTION_RUNTIME.block_on(async {
+        match storage_service.load_character(&login_token.selected_character).await {
+            Ok(Some(character)) => Ok(character),
+            Ok(None) => {
+                log::error!(
+                    "Character {} not found",
+                    &login_token.selected_character
+                );
+                Err(ConnectionRequestError::Failed)
+            },
+            Err(error) => {
+                log::error!(
+                    "Failed to load character {} with error {:?}",
+                    &login_token.selected_character,
+                    error
+                );
+                Err(ConnectionRequestError::Failed)
+            }
+        }
+    })?;
 
     // Try find clan membership
     let mut clan_membership = ClanMembership(None);
@@ -265,6 +306,7 @@ pub fn game_server_authentication_system(
     mut query_clans: Query<(Entity, &mut Clan)>,
     mut login_tokens: ResMut<LoginTokens>,
     game_data: Res<GameData>,
+    storage_service: Res<StorageService>,
 ) {
     query.for_each_mut(|(entity, mut game_client)| {
         if let Ok(message) = game_client.client_message_rx.try_recv() {
@@ -283,6 +325,7 @@ pub fn game_server_authentication_system(
                         &password,
                         &mut query_world_client,
                         &mut query_clans,
+                        &storage_service,
                     ) {
                         Ok((
                             packet_sequence_id,

@@ -9,3 +9,4 @@ Run rose-offline-server from your installed official client directory (the folde
 - `--data-idx=<path/to/data.idx>` Path to irose 129en data.idx
 - `--data-path=<path/to/data>` Path to extracted irose 129en game files
 - `--ip=<ip>` IP to listen for client connections, defaults to 127.0.0.1
+- `--use-postgres --postgres-connection=postgresql://postgres:postgres@127.0.0.1/rose_offline` using postgres as datasource with connection string

@@ -3,6 +3,8 @@ use bevy::{
     prelude::EventWriter,
 };
 use log::warn;
+use tokio::runtime::Runtime;
+use once_cell::sync::Lazy;
 
 use rose_game_common::data::Password;
 
@@ -17,8 +19,14 @@ use crate::game::{
     storage::{
         account::{AccountStorage, AccountStorageError},
         character::CharacterStorage,
+        StorageService,
     },
 };
+
+// Create a static runtime for async calls
+static WORLD_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Runtime::new().expect("Failed to create world runtime")
+});
 
 fn handle_world_connection_request(
     commands: &mut Commands,
@@ -27,6 +35,7 @@ fn handle_world_connection_request(
     world_client: &mut WorldClient,
     token_id: u32,
     password: &Password,
+    storage_service: &StorageService,
 ) -> Result<u32, ConnectionRequestError> {
     let login_token = login_tokens
         .get_token_mut(token_id)
@@ -35,29 +44,43 @@ fn handle_world_connection_request(
         return Err(ConnectionRequestError::InvalidToken);
     }
 
-    let mut account =
-        AccountStorage::try_load(&login_token.username, password).map_err(|error| {
-            match error.downcast_ref::<AccountStorageError>() {
-                Some(AccountStorageError::InvalidPassword) => {
-                    ConnectionRequestError::InvalidPassword
-                }
-                _ => {
-                    log::error!(
-                        "Failed to load account {} with error {:?}",
-                        &login_token.username,
-                        error
-                    );
-                    ConnectionRequestError::Failed
+    // Verify account password using StorageService
+    let password_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(password.to_md5());
+        hex::encode(hasher.finalize())
+    };
+
+    let account = WORLD_RUNTIME.block_on(async {
+        match storage_service.load_account(&login_token.username, &password_hash).await {
+            Ok(Some(account_storage)) => Ok(account_storage),
+            Ok(None) => Err(ConnectionRequestError::InvalidPassword),
+            Err(error) => {
+                log::error!("Failed to load account {} with error {:?}", 
+                    &login_token.username, error);
+                
+                // Check if it's specifically an invalid password error
+                if let Some(AccountStorageError::InvalidPassword) = error.downcast_ref::<AccountStorageError>() {
+                    Err(ConnectionRequestError::InvalidPassword)
+                } else {
+                    Err(ConnectionRequestError::Failed)
                 }
             }
-        })?;
+        }
+    })?;
 
     // Load character list, deleting any characters ready for deletion
     let mut character_list = CharacterList::default();
-    account
-        .character_names
-        .retain(|name| match CharacterStorage::try_load(name) {
-            Ok(character) => {
+    let mut valid_character_names = Vec::new();
+
+    for name in &account.character_names {
+        let character_result = WORLD_RUNTIME.block_on(async {
+            storage_service.load_character(name).await
+        });
+
+        match character_result {
+            Ok(Some(character)) => {
                 if character
                     .delete_time
                     .as_ref()
@@ -65,29 +88,39 @@ fn handle_world_connection_request(
                     .filter(|x| x.as_nanos() == 0)
                     .is_some()
                 {
-                    match CharacterStorage::delete(&character.info.name) {
-                        Ok(_) => log::error!(
-                            "Deleted character {} as delete timer has expired.",
-                            &character.info.name
-                        ),
-                        Err(error) => log::error!(
-                            "Failed to delete character {} with error {:?}",
-                            &character.info.name,
-                            error
-                        ),
+                    // Character delete time expired, delete it
+                    match WORLD_RUNTIME.block_on(async {
+                        storage_service.delete_character(&character.info.name).await
+                    }) {
+                        Ok(_) => log::info!("Deleted character {} as delete timer has expired.", &character.info.name),
+                        Err(error) => log::error!("Failed to delete character {} with error {:?}", &character.info.name, error),
                     }
-                    false
                 } else {
                     character_list.push(character);
-                    true
+                    valid_character_names.push(name.clone());
                 }
+            }
+            Ok(None) => {
+                log::error!("Character {} not found", name);
             }
             Err(error) => {
                 log::error!("Failed to load character {} with error {:?}", name, error);
-                false
+            }
+        }
+    }
+
+    // Update account character list if any characters were deleted
+    if account.character_names.len() != valid_character_names.len() {
+        let mut updated_account = account.clone();
+        updated_account.character_names = valid_character_names;
+        
+        WORLD_RUNTIME.block_on(async {
+            match storage_service.save_account(&updated_account).await {
+                Ok(_) => {},
+                Err(error) => log::error!("Failed to update account after character deletion: {:?}", error),
             }
         });
-    account.save().ok();
+    }
 
     // Update entity
     commands
@@ -107,6 +140,7 @@ pub fn world_server_authentication_system(
     mut commands: Commands,
     mut query: Query<(Entity, &mut WorldClient), Without<Account>>,
     mut login_tokens: ResMut<LoginTokens>,
+    storage_service: Res<StorageService>,
 ) {
     query.for_each_mut(|(entity, mut world_client)| {
         if let Ok(message) = world_client.client_message_rx.try_recv() {
@@ -122,6 +156,7 @@ pub fn world_server_authentication_system(
                         world_client.as_mut(),
                         login_token,
                         &password,
+                        &storage_service,
                     ) {
                         Ok(packet_sequence_id) => {
                             ServerMessage::ConnectionRequestSuccess { packet_sequence_id }
@@ -142,6 +177,7 @@ pub fn world_server_system(
     mut login_tokens: ResMut<LoginTokens>,
     game_data: Res<GameData>,
     mut clan_events: EventWriter<ClanEvent>,
+    storage_service: Res<StorageService>,
 ) {
     world_client_query.for_each_mut(|(world_client, mut account, mut character_list)| {
         if let Ok(message) = world_client.client_message_rx.try_recv() {
@@ -178,44 +214,62 @@ pub fn world_server_system(
                         ServerMessage::CreateCharacterError {
                             error: CreateCharacterError::InvalidValue,
                         }
-                    } else if CharacterStorage::exists(&name) {
-                        ServerMessage::CreateCharacterError {
-                            error: CreateCharacterError::AlreadyExists,
-                        }
                     } else {
-                        match game_data.character_creator.create(
-                            name.clone(),
-                            gender,
-                            birth_stone as u8,
-                            face as u8,
-                            hair as u8,
-                        ) {
-                            Ok(character) => {
-                                if let Err(error) = character.try_create(&name) {
+                        // Check if character exists using the storage service
+                        let char_exists = WORLD_RUNTIME.block_on(async {
+                            storage_service.character_exists(&name).await
+                        }).unwrap_or(true);  // Default to true on error to avoid name collision
+
+                        if char_exists {
+                            ServerMessage::CreateCharacterError {
+                                error: CreateCharacterError::AlreadyExists,
+                            }
+                        } else {
+                            match game_data.character_creator.create(
+                                name.clone(),
+                                gender,
+                                birth_stone as u8,
+                                face as u8,
+                                hair as u8,
+                            ) {
+                                Ok(character) => {
+                                    // Save character using storage service
+                                    let save_result = WORLD_RUNTIME.block_on(async {
+                                        storage_service.create_character(&character).await
+                                    });
+
+                                    if let Err(error) = save_result {
+                                        log::error!(
+                                            "Failed to create character {} with error {:?}",
+                                            &name,
+                                            error
+                                        );
+                                        ServerMessage::CreateCharacterError {
+                                            error: CreateCharacterError::Failed,
+                                        }
+                                    } else {
+                                        let character_slot = account.character_names.len();
+                                        account.character_names.push(character.info.name.clone());
+                                        
+                                        // Save account using storage service
+                                        WORLD_RUNTIME.block_on(async {
+                                            let account_storage = AccountStorage::from(&*account);
+                                            storage_service.save_account(&account_storage).await.ok()
+                                        });
+                                        
+                                        character_list.push(character);
+                                        ServerMessage::CreateCharacterSuccess { character_slot }
+                                    }
+                                }
+                                Err(error) => {
                                     log::error!(
                                         "Failed to create character {} with error {:?}",
                                         &name,
                                         error
                                     );
                                     ServerMessage::CreateCharacterError {
-                                        error: CreateCharacterError::Failed,
+                                        error: CreateCharacterError::InvalidValue,
                                     }
-                                } else {
-                                    let character_slot = account.character_names.len();
-                                    account.character_names.push(character.info.name.clone());
-                                    AccountStorage::from(&*account).save().ok();
-                                    character_list.push(character);
-                                    ServerMessage::CreateCharacterSuccess { character_slot }
-                                }
-                            }
-                            Err(error) => {
-                                log::error!(
-                                    "Failed to create character {} with error {:?}",
-                                    &name,
-                                    error
-                                );
-                                ServerMessage::CreateCharacterError {
-                                    error: CreateCharacterError::InvalidValue,
                                 }
                             }
                         }
@@ -242,14 +296,17 @@ pub fn world_server_system(
                                     character.delete_time = None;
                                 }
 
-                                match character.save() {
-                                    Ok(_) => log::info!("Saved character {}", character.info.name),
-                                    Err(error) => log::error!(
-                                        "Failed to save character {} with error {:?}",
-                                        character.info.name,
-                                        error
-                                    ),
-                                }
+                                // Save character using storage service
+                                WORLD_RUNTIME.block_on(async {
+                                    match storage_service.save_character(character).await {
+                                        Ok(_) => log::info!("Saved character {}", character.info.name),
+                                        Err(error) => log::error!(
+                                            "Failed to save character {} with error {:?}",
+                                            character.info.name,
+                                            error
+                                        ),
+                                    }
+                                });
 
                                 if let Some(delete_time) = character.delete_time {
                                     ServerMessage::DeleteCharacterStart {

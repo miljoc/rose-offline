@@ -1,5 +1,7 @@
 use bevy::ecs::prelude::{Commands, Entity, Query, Res, ResMut, Without};
-use log::warn;
+use log::{info, error, warn};
+use tokio::runtime::Runtime;
+use once_cell::sync::Lazy;
 
 use crate::game::{
     components::{Account, LoginClient},
@@ -7,13 +9,20 @@ use crate::game::{
     messages::server::{ChannelListError, JoinServerError, LoginError, ServerMessage},
     resources::{LoginTokens, ServerList},
     storage::account::{AccountStorage, AccountStorageError},
+    storage::StorageService,
 };
+
+// Create a static runtime for async calls
+static LOGIN_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Runtime::new().expect("Failed to create login runtime")
+});
 
 pub fn login_server_authentication_system(
     mut commands: Commands,
     query: Query<(Entity, &LoginClient), Without<Account>>,
     login_tokens: Res<LoginTokens>,
     server_list: Res<ServerList>,
+    storage_service: Res<StorageService>,
 ) {
     query.for_each(|(entity, login_client)| {
         if let Ok(message) = login_client.client_message_rx.try_recv() {
@@ -30,38 +39,49 @@ pub fn login_server_authentication_system(
                     let login_result = if login_tokens.find_username_token(&username).is_some() {
                         Err(LoginError::AlreadyLoggedIn)
                     } else {
-                        match AccountStorage::try_load(&username, &password) {
-                            Ok(account) => Ok(account),
-                            Err(error) => match error.downcast_ref::<AccountStorageError>() {
-                                Some(AccountStorageError::NotFound) => {
-                                    match AccountStorage::create(&username, &password) {
-                                        Ok(account) => {
-                                            log::info!("Created account {}", &username);
+                        // Calculate password hash for storage
+                        let password_hash = {
+                            use sha2::{Digest, Sha256};
+                            let mut hasher = Sha256::new();
+                            hasher.update(password.to_md5());
+                            hex::encode(hasher.finalize())
+                        };
+                        
+                        // Use storage_service for account operations
+                        LOGIN_RUNTIME.block_on(async {
+                            match storage_service.load_account(&username, &password_hash).await {
+                                Ok(Some(account)) => {
+                                    Ok(account)
+                                },
+                                Ok(None) => {
+                                    // Account does not exist, create a new one
+                                    let account = AccountStorage {
+                                        name: username.clone(),
+                                        password_md5_sha256: password_hash,
+                                        character_names: Vec::new(),
+                                    };
+                                    
+                                    match storage_service.create_account(&account).await {
+                                        Ok(()) => {
+                                            info!("Created account {}", &username);
                                             Ok(account)
-                                        }
+                                        },
                                         Err(error) => {
-                                            log::info!(
-                                                "Failed to create account {} with error {:?}",
-                                                &username,
-                                                error
-                                            );
+                                            info!("Failed to create account {} with error {:?}", &username, error);
                                             Err(LoginError::InvalidAccount)
                                         }
                                     }
+                                },
+                                Err(error) => {
+                                    error!("Failed to load account {} with error {:?}", &username, error);
+                                    if let Some(AccountStorageError::InvalidPassword) = error.downcast_ref::<AccountStorageError>() {
+                                        Err(LoginError::InvalidPassword)
+                                    } else {
+                                        Err(LoginError::Failed)
+                                    }
                                 }
-                                Some(AccountStorageError::InvalidPassword) => {
-                                    Err(LoginError::InvalidPassword)
-                                }
-                                _ => {
-                                    log::error!(
-                                        "Failed to load account {} with error {:?}",
-                                        &username,
-                                        error
-                                    );
-                                    Err(LoginError::Failed)
-                                }
-                            },
-                        }
+                            }
+                        })
                     };
 
                     let response = match login_result {
