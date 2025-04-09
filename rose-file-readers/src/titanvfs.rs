@@ -8,6 +8,7 @@ use memmap::{Mmap, MmapOptions};
 
 use crate::{reader::RoseFileReader, VfsError, VfsFile, VfsPath, VirtualFilesystemDevice};
 
+/// VFS format used by TitanROSE.
 #[derive(Debug)]
 pub struct TitanVfsIndex {
     pub version: u32,
@@ -105,7 +106,7 @@ impl From<&str> for FileNameHash {
             {
                 seed1 += seed2;
                 seed2 *= Wrapping(0x21);
-                seed1 ^= HASH_TABLE[ch.0 as usize];
+                seed1 ^= HASH_TABLE[(ch.0 & 0xff) as usize];
                 seed2 = seed2 + seed1 + ch + Wrapping(3);
             }
 
