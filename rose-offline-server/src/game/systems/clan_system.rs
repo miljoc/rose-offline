@@ -1,8 +1,11 @@
 use std::num::{NonZeroU32, NonZeroUsize};
+use log::info;
+use tokio::runtime::Runtime;
+use once_cell::sync::Lazy;
 
 use bevy::{
     ecs::query::WorldQuery,
-    prelude::{Changed, Commands, Entity, EventReader, Query, ResMut},
+    prelude::{Changed, Commands, Entity, EventReader, Query, ResMut, Res},
 };
 
 use rose_data::{ClanMemberPosition, QuestTriggerHash};
@@ -18,8 +21,13 @@ use crate::game::{
     },
     events::ClanEvent,
     resources::ServerMessages,
-    storage::clan::{ClanStorage, ClanStorageMember},
+    storage::{StorageService, ClanStorage, ClanStorageMember},
 };
+
+// Create a static runtime for async calls
+static CLAN_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Runtime::new().expect("Failed to create clan runtime")
+});
 
 #[derive(WorldQuery)]
 #[world_query(mutable)]
@@ -75,8 +83,9 @@ pub fn clan_system(
     query_member_connected: Query<MemberQuery, Changed<ClanMembership>>,
     query_member: Query<MemberQuery>,
     mut query_creator: Query<CreatorQuery>,
-    mut query_clans: Query<&mut Clan>,
+    mut query_clans: Query<(Entity, &mut Clan)>,
     mut server_messages: ResMut<ServerMessages>,
+    storage_service: Res<StorageService>,
 ) {
     for event in clan_events.iter() {
         match event {
@@ -91,7 +100,7 @@ pub fn clan_system(
                 };
 
                 // Cannot create a clan if already in one
-                if creator.clan_membership.is_some() {
+                if creator.clan_membership.0.is_some() {
                     if let Some(game_client) = creator.game_client {
                         game_client
                             .server_message_tx
@@ -115,7 +124,11 @@ pub fn clan_system(
                     continue;
                 }
 
-                if ClanStorage::exists(name) {
+                // Check if clan name exists using StorageService
+                let exists = CLAN_RUNTIME.block_on(async {
+                    storage_service.clan_exists(name).await.unwrap_or(false)
+                });
+                if exists {
                     if let Some(game_client) = creator.game_client {
                         game_client
                             .server_message_tx
@@ -139,12 +152,18 @@ pub fn clan_system(
                     continue;
                 };
 
+                // Create and save clan using StorageService
                 let mut clan_storage = ClanStorage::new(name.clone(), description.clone(), *mark);
                 clan_storage.members.push(ClanStorageMember::new(
                     creator.character_info.name.clone(),
                     ClanMemberPosition::Master,
                 ));
-                if clan_storage.try_create().is_err() {
+                
+                let create_result = CLAN_RUNTIME.block_on(async {
+                    storage_service.create_clan(&clan_storage).await
+                });
+                
+                if create_result.is_err() {
                     if let Some(game_client) = creator.game_client {
                         game_client
                             .server_message_tx
@@ -183,7 +202,7 @@ pub fn clan_system(
                 // Add clan membership to creator
                 commands
                     .entity(*creator_entity)
-                    .insert(ClanMembership::new(clan_entity));
+                    .insert(ClanMembership(Some(clan_entity)));
 
                 // Update clan to nearby entities
                 server_messages.send_entity_message(
@@ -205,7 +224,7 @@ pub fn clan_system(
                 level,
                 job,
             } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
                     if let Some(clan_member) = clan.find_online_member_mut(disconnect_entity) {
                         let &mut ClanMember::Online {
                             position,
@@ -222,6 +241,15 @@ pub fn clan_system(
                             level,
                             job,
                         };
+                        
+                        // Save the updated clan using StorageService
+                        let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                        
+                        CLAN_RUNTIME.block_on(async {
+                            if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                                log::error!("Failed to save clan after member disconnect: {:?}", err);
+                            }
+                        });
 
                         // Send message to other clan members that we have disconnected
                         for clan_member in clan.members.iter() {
@@ -249,89 +277,128 @@ pub fn clan_system(
             }
             &ClanEvent::GetMemberList { entity } => {
                 if let Ok(requestor) = query_member.get(entity) {
-                    if let Some(clan) = requestor
-                        .clan_membership
-                        .and_then(|clan_entity| query_clans.get(clan_entity).ok())
-                    {
-                        let mut members = Vec::new();
+                    if let Some(clan_entity) = requestor.clan_membership.0 {
+                        if let Ok((_, clan)) = query_clans.get(clan_entity) {
+                            let mut members = Vec::new();
 
-                        for member in clan.members.iter() {
-                            match *member {
-                                ClanMember::Online {
-                                    entity: member_entity,
-                                    position,
-                                    contribution,
-                                } => {
-                                    if let Ok(member) = query_member.get(member_entity) {
+                            for member in clan.members.iter() {
+                                match member {
+                                    ClanMember::Online {
+                                        entity: member_entity,
+                                        position,
+                                        contribution,
+                                    } => {
+                                        if let Ok(member_data) = query_member.get(*member_entity) {
+                                            members.push(ClanMemberInfo {
+                                                name: member_data.character_info.name.clone(),
+                                                position: *position,
+                                                contribution: *contribution,
+                                                channel_id: NonZeroUsize::new(1),
+                                                level: rose_game_common::components::Level::new(member_data.level.level),
+                                                job: member_data.character_info.job,
+                                            });
+                                        }
+                                    },
+                                    ClanMember::Offline {
+                                        name,
+                                        position,
+                                        contribution,
+                                        level,
+                                        job,
+                                    } => {
                                         members.push(ClanMemberInfo {
-                                            name: member.character_info.name.clone(),
-                                            position,
-                                            contribution,
-                                            channel_id: NonZeroUsize::new(1),
-                                            level: *member.level,
-                                            job: member.character_info.job,
+                                            name: name.clone(),
+                                            position: *position,
+                                            contribution: *contribution,
+                                            channel_id: None,
+                                            level: rose_game_common::components::Level::new(level.level),
+                                            job: *job,
                                         });
                                     }
                                 }
-                                ClanMember::Offline {
-                                    ref name,
-                                    position,
-                                    contribution,
-                                    level,
-                                    job,
-                                } => {
-                                    members.push(ClanMemberInfo {
-                                        name: name.clone(),
-                                        position,
-                                        contribution,
-                                        channel_id: None,
-                                        level,
-                                        job,
-                                    });
-                                }
                             }
-                        }
 
-                        if let Some(game_client) = requestor.game_client {
-                            game_client
-                                .server_message_tx
-                                .send(ServerMessage::ClanMemberList { members })
-                                .ok();
+                            if let Some(game_client) = requestor.game_client {
+                                game_client
+                                    .server_message_tx
+                                    .send(ServerMessage::ClanMemberList { members })
+                                    .ok();
+                            }
                         }
                     }
                 }
             }
             &ClanEvent::AddLevel { clan_entity, level } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
-                    if let Some(level) = clan
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
+                    if let Some(new_level) = clan
                         .level
                         .0
                         .get()
                         .checked_add_signed(level)
                         .and_then(NonZeroU32::new)
                     {
-                        clan.level = ClanLevel(level);
+                        clan.level = ClanLevel(new_level);
+                        
+                        // Save clan changes
+                        let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                        
+                        CLAN_RUNTIME.block_on(async {
+                            if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                                log::error!("Failed to save clan after level change: {:?}", err);
+                            }
+                        });
+                        
                         send_update_clan_info(&clan, &query_member);
                     }
                 }
             }
             &ClanEvent::SetLevel { clan_entity, level } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
                     clan.level = level;
+                    
+                    // Save clan changes
+                    let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                    
+                    CLAN_RUNTIME.block_on(async {
+                        if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                            log::error!("Failed to save clan after level set: {:?}", err);
+                        }
+                    });
+                    
                     send_update_clan_info(&clan, &query_member);
                 }
             }
             &ClanEvent::AddMoney { clan_entity, money } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
-                    if let Some(money) = clan.money.0.checked_add(money) {
-                        clan.money = Money(money);
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
+                    if let Some(new_money) = clan.money.0.checked_add(money) {
+                        clan.money = Money(new_money);
+                        
+                        // Save clan changes
+                        let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                        
+                        CLAN_RUNTIME.block_on(async {
+                            if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                                log::error!("Failed to save clan after money change: {:?}", err);
+                            }
+                        });
+                        
                         send_update_clan_info(&clan, &query_member);
                     }
                 }
             }
             &ClanEvent::SetMoney { clan_entity, money } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
                     clan.money = money;
+                    
+                    // Save clan changes
+                    let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                    
+                    CLAN_RUNTIME.block_on(async {
+                        if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                            log::error!("Failed to save clan after money set: {:?}", err);
+                        }
+                    });
+                    
                     send_update_clan_info(&clan, &query_member);
                 }
             }
@@ -339,9 +406,19 @@ pub fn clan_system(
                 clan_entity,
                 points,
             } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
-                    if let Some(points) = clan.points.0.checked_add_signed(points) {
-                        clan.points = ClanPoints(points);
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
+                    if let Some(new_points) = clan.points.0.checked_add_signed(points) {
+                        clan.points = ClanPoints(new_points);
+                        
+                        // Save clan changes
+                        let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                        
+                        CLAN_RUNTIME.block_on(async {
+                            if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                                log::error!("Failed to save clan after points change: {:?}", err);
+                            }
+                        });
+                        
                         send_update_clan_info(&clan, &query_member);
                     }
                 }
@@ -350,8 +427,18 @@ pub fn clan_system(
                 clan_entity,
                 points,
             } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
                     clan.points = points;
+                    
+                    // Save clan changes
+                    let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                    
+                    CLAN_RUNTIME.block_on(async {
+                        if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                            log::error!("Failed to save clan after points set: {:?}", err);
+                        }
+                    });
+                    
                     send_update_clan_info(&clan, &query_member);
                 }
             }
@@ -359,9 +446,19 @@ pub fn clan_system(
                 clan_entity,
                 skill_id,
             } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
                     if !clan.skills.iter().any(|id| *id == skill_id) {
                         clan.skills.push(skill_id);
+                        
+                        // Save clan changes
+                        let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                        
+                        CLAN_RUNTIME.block_on(async {
+                            if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                                log::error!("Failed to save clan after skill addition: {:?}", err);
+                            }
+                        });
+                        
                         send_update_clan_info(&clan, &query_member);
                     }
                 }
@@ -370,9 +467,19 @@ pub fn clan_system(
                 clan_entity,
                 skill_id,
             } => {
-                if let Ok(mut clan) = query_clans.get_mut(clan_entity) {
+                if let Ok((_, mut clan)) = query_clans.get_mut(clan_entity) {
                     if clan.skills.iter().any(|id| *id == skill_id) {
                         clan.skills.retain(|id| *id != skill_id);
+                        
+                        // Save clan changes
+                        let clan_storage = convert_clan_to_storage(&*clan, &query_member);
+                        
+                        CLAN_RUNTIME.block_on(async {
+                            if let Err(err) = storage_service.save_clan(&clan_storage).await {
+                                log::error!("Failed to save clan after skill removal: {:?}", err);
+                            }
+                        });
+                        
                         send_update_clan_info(&clan, &query_member);
                     }
                 }
@@ -383,7 +490,8 @@ pub fn clan_system(
     for connected_member in query_member_connected.iter() {
         let Some(clan) = connected_member
             .clan_membership
-            .and_then(|clan_entity| query_clans.get(clan_entity).ok())
+            .0
+            .and_then(|clan_entity| query_clans.get(clan_entity).ok().map(|(_, clan)| clan))
         else {
             continue;
         };
@@ -397,7 +505,7 @@ pub fn clan_system(
             continue;
         };
 
-        if let Some(game_client) = connected_member.game_client.as_ref() {
+        if let Some(game_client) = connected_member.game_client {
             game_client
                 .server_message_tx
                 .send(ServerMessage::ClanInfo {
@@ -441,5 +549,47 @@ pub fn clan_system(
                 }
             }
         }
+    }
+}
+
+// Helper function to convert Clan to ClanStorage
+fn convert_clan_to_storage(clan: &Clan, query_member: &Query<MemberQuery>) -> ClanStorage {
+    let mut storage_members = Vec::new();
+    
+    for member in clan.members.iter() {
+        match member {
+            ClanMember::Online { 
+                entity: member_entity, 
+                position, 
+                contribution 
+            } => {
+                // For online members, fetch the name from the query system
+                if let Ok(member_data) = query_member.get(*member_entity) {
+                    storage_members.push(ClanStorageMember {
+                        name: member_data.character_info.name.clone(),
+                        position: *position,
+                        contribution: *contribution,
+                    });
+                }
+            },
+            ClanMember::Offline { name, position, contribution, .. } => {
+                storage_members.push(ClanStorageMember {
+                    name: name.clone(),
+                    position: *position,
+                    contribution: *contribution,
+                });
+            }
+        }
+    }
+    
+    ClanStorage {
+        name: clan.name.clone(),
+        description: clan.description.clone(),
+        mark: clan.mark,
+        money: clan.money,
+        points: clan.points,
+        level: clan.level,
+        members: storage_members,
+        skills: clan.skills.clone(),
     }
 }

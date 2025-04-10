@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use log::info;
-use std::{path::Path, sync::RwLock};
+use std::{path::Path, sync::RwLock, io::Write};
 
 use crate::game::storage::{
     account::AccountStorage,
@@ -111,25 +111,73 @@ impl StorageAdapter for JsonStorageAdapter {
     }
 
     async fn create_clan(&self, clan: &ClanStorage) -> Result<()> {
-        clan.try_create()
+        let path = CLAN_STORAGE_DIR.join(format!("{}.json", &clan.name));
+        let storage_dir = path.parent().unwrap();
+        
+        std::fs::create_dir_all(storage_dir)?;
+        
+        let json = serde_json::to_string_pretty(&clan)?;
+        
+        let mut file = tempfile::Builder::new()
+            .tempfile_in(storage_dir)?;
+        file.write_all(json.as_bytes())?;
+        file.persist_noclobber(&path)?;
+        
+        Ok(())
     }
-
+    
     async fn load_clan(&self, name: &str) -> Result<Option<ClanStorage>> {
-        match ClanStorage::try_load(name) {
-            Ok(clan) => Ok(Some(clan)),
-            Err(_) => Ok(None),
+        let path = CLAN_STORAGE_DIR.join(format!("{}.json", name));
+        if !path.exists() {
+            return Ok(None);
         }
+        
+        let content = std::fs::read_to_string(&path)?;
+        let clan: ClanStorage = serde_json::from_str(&content)?;
+        Ok(Some(clan))
     }
-
+    
     async fn save_clan(&self, clan: &ClanStorage) -> Result<()> {
-        clan.save()
+        let path = CLAN_STORAGE_DIR.join(format!("{}.json", &clan.name));
+        let storage_dir = path.parent().unwrap();
+        
+        std::fs::create_dir_all(storage_dir)?;
+        
+        let json = serde_json::to_string_pretty(&clan)?;
+        
+        let mut file = tempfile::Builder::new()
+            .tempfile_in(storage_dir)?;
+        file.write_all(json.as_bytes())?;
+        file.persist(&path)?;
+        
+        Ok(())
     }
-
+    
     async fn load_clan_list(&self) -> Result<Vec<ClanStorage>> {
-        ClanStorage::try_load_clan_list()
+        let mut clans = Vec::new();
+        
+        if !CLAN_STORAGE_DIR.exists() {
+            return Ok(clans);
+        }
+        
+        for entry in std::fs::read_dir(&*CLAN_STORAGE_DIR)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(clan) = serde_json::from_str::<ClanStorage>(&content) {
+                        clans.push(clan);
+                    }
+                }
+            }
+        }
+        
+        Ok(clans)
     }
-
+    
     async fn clan_exists(&self, name: &str) -> Result<bool> {
-        Ok(ClanStorage::exists(name))
+        let path = CLAN_STORAGE_DIR.join(format!("{}.json", name));
+        Ok(path.exists())
     }
 }
